@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Environment + secrets
+.env
+.env.*
+!.env.example
+
+# Local data (per-Agent persisted history + boxed state)
+data/
+.rumi_demo_data/
+
+# Personal scratch scripts (anything prefixed with one underscore — keep __init__.py)
+_*.py
+!__init__.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+output/
+scripts/live_smoke.py
+
+# Rust build artifacts (rumi-core native extension). Cargo.lock IS committed
+# for reproducible cdylib builds; compiled extensions (*.pyd) are already
+# covered by *.py[cod] above, *.so below.
+/rumi-core/target/
+target/
+*.so
+
+# Go build output (rumi-edge daemon binary)
+/rumi-edge/rumi-edge
+/rumi-edge/rumi-edge.exe

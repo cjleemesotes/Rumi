@@ -1,0 +1,54 @@
+[build-system]
+requires = ["maturin>=1.10,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rumi"
+version = "0.1.0"
+description = "A slim agentic library — Dervish + Heart (OpenRouter only) + Tools + Tablet. Library-only, sync-only."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+keywords = ["agents", "llm", "openrouter", "tools", "sufi", "rumi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "pydantic>=2.11",
+    "openai>=1.109",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.urls]
+Repository = "https://github.com/cjleemesotes/Rumi"
+Issues = "https://github.com/cjleemesotes/Rumi/issues"
+
+[tool.maturin]
+# Mixed Python/Rust project: the pure-Python package lives under src/rumi,
+# and the native extension (the Rust `rumi-core` crate, lib name `_core`) is
+# placed as the `rumi._core` submodule. abi3 → one wheel spans CPython 3.11+.
+manifest-path = "rumi-core/Cargo.toml"
+python-source = "src"
+module-name = "rumi._core"
+features = ["pyo3/extension-module"]
+# `examples/`, `tests/`, `scripts/` sit at the repo top level, parallel to
+# src/ — they are reference/dev code and are NOT shipped in the wheel.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# Repo root on the path so tests can import the top-level `examples/` package;
+# `rumi-edge` so tests can import the `rumi_worker` shim.
+pythonpath = [".", "rumi-edge"]

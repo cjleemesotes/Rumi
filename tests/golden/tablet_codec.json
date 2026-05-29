@@ -1,0 +1,62 @@
+[
+  {
+    "key": "",
+    "file": "__root__",
+    "decoded": ""
+  },
+  {
+    "key": "_",
+    "file": "%5f",
+    "decoded": "_"
+  },
+  {
+    "key": "a/b",
+    "file": "a__b",
+    "decoded": "a/b"
+  },
+  {
+    "key": "a__b",
+    "file": "a%5f%5fb",
+    "decoded": "a__b"
+  },
+  {
+    "key": "history/abc-123",
+    "file": "history__abc-123",
+    "decoded": "history/abc-123"
+  },
+  {
+    "key": "x.y",
+    "file": "x.y",
+    "decoded": "x.y"
+  },
+  {
+    "key": "a b!",
+    "file": "a%20b%21",
+    "decoded": "a b!"
+  },
+  {
+    "key": "café",
+    "file": "café",
+    "decoded": "café"
+  },
+  {
+    "key": "100%done",
+    "file": "100%25done",
+    "decoded": "100%done"
+  },
+  {
+    "key": "tab\tchar",
+    "file": "tab%09char",
+    "decoded": "tab\tchar"
+  },
+  {
+    "key": "settings/theme",
+    "file": "settings__theme",
+    "decoded": "settings/theme"
+  },
+  {
+    "key": "Researcher__r-1",
+    "file": "Researcher%5f%5fr-1",
+    "decoded": "Researcher__r-1"
+  }
+]
