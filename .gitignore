@@ -51,3 +51,19 @@ target/
 # Go build output (rumi-edge daemon binary)
 /rumi-edge/rumi-edge
 /rumi-edge/rumi-edge.exe
+
+# Poet/sales-intelligence scratch work — eval runs, prospect data, company
+# dossiers, generated PDFs/reports. Local-only; never publish these.
+*.log
+*.pdf
+*.html
+report_*.md
+leads_*
+*_poet_queries.md
+leadpoet_improvement_dossier.md
+poet_iteration_notes.md
+pdfbuild/
+/eval_poet.py
+/poet_selftest.py
+/poet_server.py
+/run_poet_live.py

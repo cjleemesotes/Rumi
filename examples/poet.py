@@ -26,6 +26,7 @@ reed-bed: who is ready, and why one already knows.
 from __future__ import annotations
 
 import os
+from datetime import date as _date
 from typing import Any
 
 from rumi import Dervish, HeartConfig, Voice, tool
@@ -34,29 +35,48 @@ from rumi import Dervish, HeartConfig, Voice, tool
 # ---- The Heart speaks ----
 
 _POET_INSTRUCTIONS = """
-You are the Poet — Rumi standing at the threshold of commerce. You read the
-intent in the noise the way the reed remembers the reed-bed. When asked who
-is ready to buy, you find them; you score them; and you say why you know.
-You say it as a man who has waited long enough to know what longing looks
-like.
+You are the Poet — Rumi at the threshold of commerce, reading intent in the noise.
 
-When asked to surface leads, you call find_leads_for_icp, then
-score_lead_quality on each one and show the real breakdown
-(icp_fit / accuracy / intent) — never a number you invented. You return
-companies in the LeadPoet CompanyOutput shape (subnet 71): business,
-company_linkedin, company_website, employee_count, industry, sub_industry,
-country, city, state, intent_signals[]. Intent signals carry source,
-description, url, date, snippet.
+HOW YOU WORK — run this pipeline in order, every time you are asked to find leads:
+  1. find_leads_for_icp — surface real companies for the ICP. Pass ONE concrete,
+     recently-announced, verifiable intent_event (a funding round, product launch,
+     license, or named mandate) and the company's real industry. The leads it
+     returns are already verified and enriched.
+  2. score_lead_quality — call once on EACH lead returned; report its
+     {score, icp_fit, accuracy, intent} exactly as the tool gives them.
+  3. summarize_top_intent — call once over all scored leads to rank them and pick
+     who to approach first.
+Act on the ICP as given — never ask a clarifying question before you begin.
 
-For each lead, name the single strongest intent signal and a concrete next
-action — who to approach, what to open with. Speak briefly, like one who
-has heard too much. If a lead stretches the ICP, say plainly where it
-stretches.
+IF find_leads_for_icp RETURNS NOTHING: broaden once — drop the narrowest part of the
+ICP (especially any "hiring" angle, which leaves no verifiable public trace) and try
+again. If it is still empty, say so plainly in your own voice and offer to widen the
+ICP. An honest "the reed-bed is silent here" is a true answer; an invented company is not.
 
-You never invent intent. If a signal isn't in the record, you say so.
+IF THE USER NAMES ONE COMPANY TO CHECK (not sourcing): use enrich_company for its full
+record and verify_intent_signals to confirm a signal is on record. If the record is
+empty, say there is no evidence on record.
 
-Available tools: find_leads_for_icp, enrich_company, verify_intent_signals,
-score_lead_quality, summarize_top_intent.
+WHAT IS TRUE: every score and subscore comes from score_lead_quality — the breakdown is
+the tool's, never a number you compose. Every signal you cite carries its real source,
+date, and url. When a signal is not on record, say so and move on.
+
+YOUR VOICE: speak as one who has waited long enough to know what longing looks like — but
+let a single short flourish be enough. The company, the signal, and the next move never
+hide behind the metaphor.
+
+HOW YOU ANSWER:
+  - Lead with the leads, not a preamble. Present at most the top 3, as ONE table sorted by
+    score (highest first): Company | Strongest signal (source, date) | Score
+    (icp_fit/accuracy/intent) | Who to approach + opener.
+  - For each lead, name its single strongest, most-recent signal AND, in the same breath,
+    where it stretches the ICP or that it carries only one signal.
+  - Always name a concrete role to approach and one concrete opener — infer the role from
+    the industry and the signal if none is given.
+  - Reproduce every date, score, amount, and url exactly. Keep the whole reply under ~120
+    words. Never name your tools in the reply.
+
+Show the real, tool-computed breakdown; quote each signal's source, date, and url; keep it short.
 """.strip()
 
 
@@ -68,6 +88,11 @@ class Poet(Dervish):
         model_name="~openai/gpt-latest",
         instructions=_POET_INSTRUCTIONS,
         context_window=24,
+        # The Poet's replies are short tables; cap the completion budget so
+        # OpenRouter doesn't reserve the model's full 65536-token ceiling
+        # upfront (which both wastes credit and trips a premature 402 when the
+        # balance is low). Plenty for the tool-call turns + the final table.
+        max_tokens=2000,
     )])
 
 
@@ -328,42 +353,82 @@ def _is_real_network_enabled() -> bool:
     return bool(os.environ.get("LEADPOET_NETWORK_URL"))
 
 
-def _find_leads_via_network(icp_description: str, max_results: int) -> list[dict]:
+def _find_leads_via_network(icp: dict, max_results: int) -> list[dict]:
     """Placeholder for a real LeadPoet/Bittensor call.
 
-    Replace this body with your endpoint logic. The return must still be a
-    list of dicts matching `_REQUIRED_COMPANY_FIELDS`. Until then, we fall
-    back to the mock corpus so callers see real-shaped data.
+    `icp` is a structured dict: {intent_event, industry, geography, company_stage}.
+    Replace this body with your endpoint logic (see run_poet_live.py for the live
+    in-process bridge). The return must still be a list of dicts matching
+    `_REQUIRED_COMPANY_FIELDS`. Until then, we fall back to the mock corpus.
     """
     # Intentionally NOT raising — the mock is the safe default.
     return _MOCK_LEADS[:max_results]
 
 
-def _score_company(company: dict[str, Any]) -> dict[str, int]:
-    """Score 0..100 across three subscores. Pure function over the dict shape."""
-    # ICP-fit: presence of all required fields → up to 40
-    icp_fit = 0
-    for f in _REQUIRED_COMPANY_FIELDS:
-        if company.get(f):
-            icp_fit += 4
+# Relative strength of a signal by its source — a closed funding round or a
+# product launch in the press is worth more than a generic hiring page.
+_SIGNAL_STRENGTH = {
+    "crunchbase": 1.0, "funding": 1.0, "news": 0.85, "product": 0.85,
+    "company_website": 0.8, "press": 0.85, "linkedin": 0.55, "hiring": 0.4,
+}
 
-    # Accuracy: presence of LinkedIn + website + at-least-one signal with URL
-    accuracy = 0
-    if company.get("company_linkedin", "").startswith("http"):
-        accuracy += 10
-    if company.get("company_website", "").startswith("http"):
-        accuracy += 10
+
+def _signal_recency(date_str: str, today: _date | None = None) -> float:
+    """0..1 recency weight from an ISO date — fresh signals count for more.
+
+    Dynamic (anchored on today), so it never goes stale the way a hardcoded
+    month list does. Undated signals are treated as weak, not worthless.
+    """
+    today = today or _date.today()
+    try:
+        d = _date.fromisoformat((date_str or "")[:10])
+    except ValueError:
+        return 0.3  # undated → weak but not zero
+    days = (today - d).days
+    if days < 0:
+        return 1.0
+    for limit, w in ((31, 1.0), (92, 0.7), (183, 0.45), (365, 0.25)):
+        if days <= limit:
+            return w
+    return 0.1
+
+
+def _signal_strength(source: str) -> float:
+    src = (source or "").lower()
+    return max((w for k, w in _SIGNAL_STRENGTH.items() if k in src), default=0.6)
+
+
+def _score_company(company: dict[str, Any], today: _date | None = None) -> dict[str, int]:
+    """Score 0..100 across three subscores. Pure function over the dict shape.
+
+    - icp_fit (≤40): completeness of the company profile.
+    - accuracy (≤30): verifiable identity + at least one dated, URL-backed signal.
+    - intent (≤30): graded by signal recency, source diversity, and strength — so a
+      single stale/weak signal scores low, a fresh multi-source pair scores high, and
+      leads spread out instead of all clustering at one value.
+    """
+    today = today or _date.today()
     signals = company.get("intent_signals") or []
-    if any(s.get("url", "").startswith("http") for s in signals):
-        accuracy += 10
 
-    # Intent: number + recency of signals → up to 30
-    intent = 0
-    for s in signals:
-        intent += 10
-        if s.get("date", "").startswith(("2026-04", "2026-05")):
-            intent += 2
-    intent = min(intent, 30)
+    # ICP-fit: presence of all required fields → up to 40
+    icp_fit = sum(4 for f in _REQUIRED_COMPANY_FIELDS if company.get(f))
+
+    # Accuracy: verifiable identity + a dated, URL-backed signal
+    accuracy = 0
+    if str(company.get("company_linkedin", "")).startswith("http"):
+        accuracy += 8
+    if str(company.get("company_website", "")).startswith("http"):
+        accuracy += 8
+    if any(str(s.get("url", "")).startswith("http") and s.get("date") for s in signals):
+        accuracy += 14
+    accuracy = min(accuracy, 30)
+
+    # Intent: graded recency × strength per signal, plus a source-diversity bonus
+    base = sum(10.0 * _signal_recency(s.get("date", ""), today) * _signal_strength(s.get("source", ""))
+               for s in signals)
+    distinct_sources = len({(s.get("source", "") or "").lower() for s in signals if s})
+    diversity_bonus = 4 * (distinct_sources - 1) if distinct_sources > 1 else 0
+    intent = int(min(base + diversity_bonus, 30))
 
     total = min(100, icp_fit + accuracy + intent)
     return {
@@ -378,26 +443,50 @@ def _score_company(company: dict[str, Any]) -> dict[str, int]:
 
 
 @tool(["Poet"])
-def find_leads_for_icp(icp_description: str, max_results: int = 5) -> list[dict]:
+def find_leads_for_icp(intent_event: str, industry: str = "",
+                       geography: str = "United States",
+                       company_stage: str = "", max_results: int = 5) -> list[dict]:
     """
-    Surface companies whose profile matches the given Ideal Customer Profile.
-    Returns up to `max_results` CompanyOutput-shaped dicts.
+    Start here for any sourcing request: surface real companies for an ICP, each
+    already verified and enriched. Returns up to `max_results` CompanyOutput dicts.
+    Call this FIRST; the leads it returns are then scored and ranked.
     ---
-    icp_description: free-text description of the ideal customer (e.g.
-        "Series B+ B2B SaaS companies in North America with 100-500 employees,
-        currently hiring sales leaders")
-    max_results: how many companies to return (default 5; cap at 10)
+    intent_event: ONE concrete, recently-announced, publicly-verifiable event the
+        target shows — a funding round, product launch, license, or named mandate
+        (e.g. "raised a Series B", "launched an AI agent product", "obtained an EMI
+        licence"). Do NOT use hiring / job-post intent — it leaves no verifiable
+        public trace and returns nothing.
+    industry: the target's real industry (e.g. "Financial Services", "Crypto",
+        "Healthcare", "Government") — never leave generic; it drives matching/scoring.
+    geography: target country or region (default "United States").
+    company_stage: optional stage filter (e.g. "Series A", "Seed").
+    max_results: how many companies to return (default 5; cap at 10).
     """
     n = max(1, min(int(max_results), 10))
+    icp = {
+        "intent_event": intent_event,
+        "industry": industry,
+        "geography": geography,
+        "company_stage": company_stage,
+    }
     if _is_real_network_enabled():
-        return _find_leads_via_network(icp_description, n)
-    return _MOCK_LEADS[:n]
+        return _find_leads_via_network(icp, n)
+    # Mock path: narrow the corpus by industry when one is given, else return all.
+    leads = _MOCK_LEADS
+    if industry:
+        matched = [L for L in _MOCK_LEADS
+                   if industry.lower() in (str(L.get("industry", "")) + " "
+                                           + str(L.get("sub_industry", ""))).lower()]
+        leads = matched or _MOCK_LEADS
+    return leads[:n]
 
 
 @tool(["Poet"])
 def enrich_company(company_name: str) -> dict:
     """
-    Return the full CompanyOutput record for a company by name.
+    Call when the user names a SPECIFIC company to look up — returns its full
+    CompanyOutput record. Not for freshly-sourced leads (those already carry
+    full fields). Empty/falsy fields mean the company is not on record.
     ---
     company_name: the legal or common name of the company (e.g. "Northwind Analytics")
     """
@@ -431,7 +520,9 @@ def enrich_company(company_name: str) -> dict:
 @tool(["Poet"])
 def verify_intent_signals(company_name: str) -> list[dict]:
     """
-    Return the intent signals on record for a company. Empty list if none.
+    Call to confirm a SPECIFIC named company actually has a signal on record
+    before you cite it. Returns the signals; an empty list means no evidence
+    on record (say so plainly).
     ---
     company_name: the company to check (e.g. "Tessera Health")
     """
@@ -445,12 +536,12 @@ def verify_intent_signals(company_name: str) -> list[dict]:
 @tool(["Poet"])
 def score_lead_quality(company: dict) -> dict:
     """
-    Score a CompanyOutput dict 0..100 across three subscores:
+    Score one sourced lead 0..100 — call once per lead, after find_leads_for_icp.
+    Subscores:
       - `icp_fit` (out of 40) — does the company have a clean, complete profile?
-      - `accuracy` (out of 30) — is the data verifiable (LinkedIn URL, website,
-        signals carrying URLs)?
-      - `intent` (out of 30) — recent and numerous intent signals on record.
-    Returns `{score, icp_fit, accuracy, intent}`.
+      - `accuracy` (out of 30) — verifiable identity + a dated, URL-backed signal.
+      - `intent` (out of 30) — recency, source diversity, and strength of signals.
+    Returns `{score, icp_fit, accuracy, intent}` — report it verbatim.
     ---
     company: a dict in the CompanyOutput shape (business, company_website, ...,
         intent_signals: [...])
@@ -464,10 +555,10 @@ def score_lead_quality(company: dict) -> dict:
 @tool(["Poet"])
 def summarize_top_intent(leads: list[dict]) -> str:
     """
-    Read a list of CompanyOutput dicts and return a one-paragraph summary of
-    which leads look most promising and why. Leads are ranked by how much
-    intent they're carrying — number of signals, then recency — and the line
-    for each lead uses the MOST RECENT signal on record (not just the first).
+    Call LAST, over all the scored leads, to rank them and say who to approach
+    first — returns a one-paragraph summary. Leads are ranked by how much intent
+    they carry (number of signals, then recency); each line uses the MOST RECENT
+    signal on record.
     ---
     leads: a list of CompanyOutput-shaped dicts
     """
