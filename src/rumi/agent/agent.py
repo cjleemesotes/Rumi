@@ -14,6 +14,8 @@ The public surface (mirrors nodeai's where it makes sense):
   either a string key or a pydantic class as the key.
 - `get_agent(type, id)` / `use_tool(name, args)` for cross-Dervish + direct-tool
   calls.
+- `pending_tool_calls()` / `record_recovered_result(...)` to recover a tool
+  call interrupted before its result was saved (see `rumi.agent.recovery`).
 
 What's not here, deliberately: `send()`, `whirl_once()`, `register_internal_tool`,
 streaming, hot reload. See the DROPPED list in the README.
@@ -26,11 +28,19 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 from pydantic import BaseModel
 
+from rumi.agent import recovery as _recovery
 from rumi.agent import registry
+from rumi.agent.recovery import (
+    PendingToolCall,
+    RecoveryConflictError,
+    RecoveryNeededError,
+    ToolCallNotFoundError,
+    UnsupportedRecoveryError,
+)
 from rumi.heart.config import HeartConfig
 from rumi.heart.openrouter import OpenRouterHeart
 from rumi.ideas.base import IIdea
-from rumi.ideas.types import TextIdea
+from rumi.ideas.types import TextIdea, ToolRequestIdea, ToolResultIdea
 from rumi.tablet.filesystem import _snake_case
 from rumi.tools.registry import Tools
 
@@ -204,9 +214,190 @@ class Dervish:
         defaults to None — an ordinary `agent.whirl("...")` is unaffected.
         The rumi-edge daemon supplies one so A2A `tasks/cancel` can
         cooperatively stop a running whirl across the process seam.
+
+        Raises `RecoveryNeededError` if saved history has an unfinished tool
+        call (see `pending_tool_calls`). The check runs first — before
+        `message` is saved, any hook fires, or the model is called — so a
+        refused whirl leaves history untouched.
         """
+        # Deliberately here, not in a lifecycle hook: `_safe_hook` swallows
+        # exceptions, and the Rust pipeline saves the input before any hook.
+        scan = _recovery._scan_history(self._ideas)
+        if scan.unfinished:
+            raise RecoveryNeededError(
+                _recovery._needed_message(self._recovery_subject(), scan),
+                agent_type=self._agent_type,
+                agent_id=self._agent_id,
+                pending=scan.unfinished,
+                reason=scan.reason,
+            )
         from rumi._core import run_whirl_pipeline  # the native whirl pipeline
         return run_whirl_pipeline(self, message, response_model, cancel_check)
+
+    # ---- Recovery: a tool call interrupted before its result was saved ----
+
+    def pending_tool_calls(self) -> list[PendingToolCall]:
+        """Unfinished tool calls in this Dervish's saved history.
+
+        An unfinished call is one whose request was saved but whose result
+        was not — the process stopped after the tool ran (or started) and
+        before rumi saved what it returned. Returns `[]` when history is
+        consistent, or a one-item list in the supported shape:
+
+            [{"request_idea_id": str, "tool_call_id": str,
+              "tool_name": str, "arguments": dict}]
+
+        Plain dicts, safe to `json.dumps` and to mutate. Read-only: no model
+        call, no tool execution, no write or repair. It reflects the history
+        this instance loaded at construction plus its own writes, so after a
+        restart construct the agent as usual and call this.
+
+        Raises `UnsupportedRecoveryError` (with `.reason` and `.calls`) for
+        unfinished calls outside the supported shape — see
+        `rumi.agent.recovery` for the reason codes.
+        """
+        scan = _recovery._scan_history(self._ideas)
+        if scan.reason is not None:
+            raise UnsupportedRecoveryError(
+                scan.reason, f"{self._recovery_subject()} [{scan.reason}]: {scan.detail}",
+                calls=scan.unfinished,
+            )
+        return scan.unfinished  # type: ignore[return-value]  # fresh dicts per scan
+
+    def record_recovered_result(
+        self,
+        request_idea_id: str,
+        tool_call_id: str,
+        result: Any,
+    ) -> ToolResultIdea:
+        """Save a confirmed result for an interrupted tool call; return it.
+
+        The tool is NOT run again. The caller establishes what happened in
+        the external system and passes that outcome as `result` — a `str`
+        (saved verbatim) or a JSON-compatible value (saved as
+        `json.dumps(result, ensure_ascii=False)`). To record that the tool
+        did not take effect, pass a string saying so, e.g. "ERROR: ...".
+
+        The tool name comes from the stored request; the saved
+        `ToolResultIdea` carries the original `tool_call_id` and
+        `metadata["recovered"] = True`, and is written through the normal
+        persistence path (disk first, then memory). After this, `whirl()`
+        works again as a new invocation over the repaired history.
+
+        Idempotent across restarts: if the call already has a saved result
+        that is the same (see `rumi.agent.recovery`), that result is returned
+        and nothing is written; a different saved result raises
+        `RecoveryConflictError`.
+
+        Raises (history unchanged in every case):
+            TypeError / ValueError: an id is not a str, or `result` is not a
+                str / JSON-compatible value.
+            ToolCallNotFoundError: no saved tool request has that id, or it
+                holds no call with that `tool_call_id`.
+            RecoveryConflictError: a different result is already saved.
+            UnsupportedRecoveryError: the history is outside the supported
+                shape, or this instance is stale (`reason="stale_history"`).
+            Tablet errors (e.g. OSError) if saving fails.
+        """
+        if not isinstance(request_idea_id, str) or not isinstance(tool_call_id, str):
+            raise TypeError(
+                "record_recovered_result(request_idea_id, tool_call_id, result): "
+                "both ids must be strings, as returned by pending_tool_calls(). "
+                f"Got {type(request_idea_id).__name__} and {type(tool_call_id).__name__}."
+            )
+        content = _recovery._normalize_result(result)
+        subject = self._recovery_subject()
+
+        # 1. Resolve the exact (request, call) pair in saved history.
+        index = next(
+            (i for i, idea in enumerate(self._ideas) if idea.id == request_idea_id), None
+        )
+        if index is None:
+            raise ToolCallNotFoundError(
+                f"{subject}: no saved idea has id {request_idea_id!r}.",
+                request_idea_id=request_idea_id, tool_call_id=tool_call_id,
+            )
+        request = self._ideas[index]
+        if not isinstance(request, ToolRequestIdea):
+            raise ToolCallNotFoundError(
+                f"{subject}: saved idea {request_idea_id!r} is a "
+                f"{type(request).__name__}, not a tool request.",
+                request_idea_id=request_idea_id, tool_call_id=tool_call_id,
+            )
+        calls = [c for c in request.content if c.get("id") == tool_call_id]
+        if not calls:
+            owners = [
+                idea.id for idea in self._ideas
+                if isinstance(idea, ToolRequestIdea)
+                and any(c.get("id") == tool_call_id for c in idea.content)
+            ]
+            hint = f" (that id belongs to request(s) {owners})" if owners else ""
+            raise ToolCallNotFoundError(
+                f"{subject}: tool request {request_idea_id!r} has no tool call "
+                f"{tool_call_id!r}{hint}; its calls are "
+                f"{[c.get('id') for c in request.content]}.",
+                request_idea_id=request_idea_id, tool_call_id=tool_call_id,
+            )
+        if len(calls) > 1:
+            raise UnsupportedRecoveryError(
+                _recovery.INVALID_TOOL_CALL,
+                f"{subject}: tool request {request_idea_id!r} holds tool call id "
+                f"{tool_call_id!r} more than once.",
+            )
+
+        # 2. Already answered? The persisted results decide — this survives a
+        #    restart because replay loads them like any other idea.
+        existing = [
+            r for r in _recovery._results_after(self._ideas, index)
+            if r.tool_call_id == tool_call_id
+        ]
+        if len(existing) > 1:
+            raise UnsupportedRecoveryError(
+                _recovery.DUPLICATE_RESULTS,
+                f"{subject}: tool call {tool_call_id!r} already has "
+                f"{len(existing)} saved results.",
+            )
+        if existing:
+            saved = existing[0]
+            if _recovery._same_result(saved.content, content):
+                return saved
+            raise RecoveryConflictError(
+                f"{subject}: tool call {tool_call_id!r} (request "
+                f"{request_idea_id!r}) already has a different saved result "
+                f"(idea {saved.id!r}): {saved.content!r}; refusing to record "
+                f"{content!r}.",
+                request_idea_id=request_idea_id, tool_call_id=tool_call_id,
+                existing=saved, supplied=content,
+            )
+
+        # 3. Unanswered: it must be THE supported pending call (the scan only
+        #    passes a single-call request that ends history).
+        scan = _recovery._scan_history(self._ideas)
+        if scan.reason is not None:
+            raise UnsupportedRecoveryError(
+                scan.reason, f"{subject} [{scan.reason}]: {scan.detail}",
+                calls=scan.unfinished,
+            )
+        # 4. Only write onto the history that is actually saved.
+        _recovery._check_in_sync(self._tablet, self._ideas, subject)
+
+        # 5. Save through the normal persistence path.
+        idea = ToolResultIdea(
+            tool_call_id=tool_call_id,
+            name=calls[0]["function"]["name"],
+            content=content,
+            metadata={"recovered": True},
+        )
+        _recovery._sort_after(idea, request)
+        self._append_idea(idea)
+        self._logger.info(
+            "rumi.agent.recovered_tool_result request=%s tool_call=%s tool=%s",
+            request_idea_id, tool_call_id, idea.name,
+        )
+        return idea
+
+    def _recovery_subject(self) -> str:
+        return f"{type(self).__name__}(agent_id={self._agent_id!r})"
 
     def inscribe(self, key: str | type[BaseModel], value: Any) -> None:
         """Write `value` onto this Dervish's tablet, under `key`.
