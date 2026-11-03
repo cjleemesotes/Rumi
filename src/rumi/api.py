@@ -6,12 +6,23 @@ Stable exports (mirroring nodeai's surface for cognitive parity):
 - Tools: `tool`, `inscribe`
 - Thoughts: `IIdea`, `TextIdea`, `ToolRequestIdea`, `ToolResultIdea`,
   `JsonIdea`, `BaseModelIdea`
+- Recovery (an interrupted tool call): `PendingToolCall`, `RecoveryError`,
+  `RecoveryNeededError`, `UnsupportedRecoveryError`, `ToolCallNotFoundError`,
+  `RecoveryConflictError`
 """
 from __future__ import annotations
 
 from rumi.heart.config import HeartConfig, Voice
 from rumi.heart.openrouter import OpenRouterHeart
 from rumi.agent.agent import Dervish, inscribe
+from rumi.agent.recovery import (
+    PendingToolCall,
+    RecoveryConflictError,
+    RecoveryError,
+    RecoveryNeededError,
+    ToolCallNotFoundError,
+    UnsupportedRecoveryError,
+)
 from rumi.world import World
 from rumi.ideas.base import IIdea
 from rumi.ideas.types import (
@@ -41,4 +52,11 @@ __all__ = [
     "ToolResultIdea",
     "JsonIdea",
     "BaseModelIdea",
+    # recovery
+    "PendingToolCall",
+    "RecoveryError",
+    "RecoveryNeededError",
+    "UnsupportedRecoveryError",
+    "ToolCallNotFoundError",
+    "RecoveryConflictError",
 ]

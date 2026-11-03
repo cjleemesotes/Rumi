@@ -191,6 +191,41 @@ All env vars can be overridden via explicit `World(...)` kwargs. The reference
 Dervishes in `examples/` may read their own env vars (e.g. `LEADPOET_NETWORK_URL`
 for the Poet's optional real-network seam).
 
+### Recovering an Interrupted Tool Call
+
+If a process dies after a tool acted but before rumi saved its result, the
+saved history ends on an unanswered tool request. Until that call's outcome
+is recorded, `whirl()` raises `RecoveryNeededError` — before saving the new
+input or calling the model. Rumi never re-runs the tool: you check the system
+it acted on and hand back what actually happened.
+
+```python
+agent = Cashier(world=World(), agent_id="till-1")   # restarted process, same storage
+
+for call in agent.pending_tool_calls():             # read-only; [] when consistent
+    # {"request_idea_id": "4f0c…", "tool_call_id": "call_pay_1",
+    #  "tool_name": "record_payment", "arguments": {"order_id": "A-1", "amount": 42}}
+    outcome = find_payment(call["arguments"]["order_id"])   # your check, e.g. a DB query
+    agent.record_recovered_result(call["request_idea_id"], call["tool_call_id"], outcome)
+
+agent.whirl("Did the payment go through?")          # works again
+```
+
+- `RecoveryNeededError.pending` carries the same dicts, so whatever catches it
+  can hand them to a recovery console.
+- The result may be a `str` (saved verbatim) or any JSON-compatible value
+  (saved as `json.dumps(value, ensure_ascii=False)`). If the tool did *not*
+  take effect, record a string that says so.
+- Recording the same result again, even from another process, returns the
+  saved `ToolResultIdea` and writes nothing. A different result raises
+  `RecoveryConflictError`, and unknown or mismatched ids raise
+  `ToolCallNotFoundError`. A failed call leaves history unchanged.
+- Supported: one unfinished call, in a single-call request, at the end of
+  history, with one writer per agent. Any other unfinished shape raises
+  `UnsupportedRecoveryError` (with a `reason`) from `pending_tool_calls()`, and
+  `whirl()` raises `RecoveryNeededError` with `recoverable == False`. See
+  `src/rumi/agent/recovery.py`.
+
 ---
 
 <p align="center"><em>This library is a small boat. The Dervishes inside it turn.</em></p>
